@@ -201,7 +201,7 @@ class LimeTabularExplainer(object):
         self.categorical_names = categorical_names or {}
         self.sample_around_instance = sample_around_instance
         self.training_data_stats = training_data_stats
-        self.training_data = training_data  # maintian copy of training_data
+        self.training_data = training_data  # maintain copy of training_data
         self.modelless_method = modelless_method
         # Check and raise proper error in stats are supplied in non-descritized path
         if self.training_data_stats:
@@ -283,7 +283,7 @@ class LimeTabularExplainer(object):
         )
         self.class_names = class_names
 
-        # Though set has no role to play if training data stats are provided
+        # Training set has no role to play if training data stats are provided
         self.scaler = sklearn.preprocessing.StandardScaler(with_mean=False)
         self.scaler.fit(training_data)
         self.feature_values = {}
@@ -309,6 +309,9 @@ class LimeTabularExplainer(object):
             self.scaler.mean_[feature] = 0
             self.scaler.scale_[feature] = 1
 
+        if self.modelless_method is not None:
+            self.scaled_training_data = self.scale_data(self.training_data)
+
     @staticmethod
     def convert_and_round(values):
         return ["%.2f" % v for v in values]
@@ -333,6 +336,40 @@ class LimeTabularExplainer(object):
                 "Missing keys in training_data_stats. Details: %s" % (missing_keys)
             )
 
+    def one_hot_encode(self, data: np.ndarray) -> np.ndarray:
+        """
+        One hot encode dataset for valid distance computation on categorical variables.
+
+        Args:
+            data (np.ndarray): Original data
+
+        Returns:
+            np.ndarray: One hot encoded data
+        """
+        numerical_features = data[
+            :, [i for i in range(data.shape[1]) if i not in self.categorical_features]
+        ]
+        categorical_features = np.zeros((data.shape[0], 1))
+        for column in self.categorical_features:
+            new = self._one_hot_encode(
+                data[:, column], np.max(self.training_data[:, column])
+            )
+            categorical_features = np.concatenate((new, categorical_features), axis=1)
+        return np.concatenate((numerical_features, categorical_features), axis=1)
+
+    @staticmethod
+    def _one_hot_encode(column: np.ndarray, max_: int) -> np.ndarray:
+        """One hot encode categorical column
+
+        Args:
+            column (np.ndarray): Integer encoded categorical column
+
+        Returns:
+            np.ndarray: (n, n_classes) One hot encoded column
+        """
+        n_values = max_ + 1
+        return np.eye(int(n_values))[column.astype(int)]
+
     def perturbation_training_neighbors(self, inverse):
         """Get 1 Nearest Neighbor from training data for each point in the local perturbation around the
         feature of interest
@@ -341,12 +378,33 @@ class LimeTabularExplainer(object):
             inverse (np.array): Perturbed datapoints
 
         Returns:
-            set of training datapoints with number equal to the size of inverse
+            distances (np.array) : Array of distances from each perturbation data point to the closest training data point.
+            neighbors (np.array) set of training datapoints with number equal to the size of inverse
+            scaled_neighbors (np.array)
         """
-        nearest_neighbors = NearestNeighbors(n_neighbors=1)
-        nearest_neighbors.fit(self.training_data)
+        nearest_neighbors = NearestNeighbors(
+            n_neighbors=1,
+            # metric=lambda a, b: self.custom_distance_function(a, b),
+            # algorithm=",
+        )
+        nearest_neighbors.fit(self.one_hot_encoded_training_data)
         distances, neighbors = nearest_neighbors.kneighbors(inverse)
-        return distances, self.training_data[neighbors] # distances are dinstacne to training data point for each perturbation 
+        return (
+            distances,
+            self.training_data[neighbors],
+            self.scaled_training_data[neighbors],
+        )  # distances are distance from perturbation to training data point for each perturbation
+
+    def scale_data(self, data):
+        if sp.sparse.issparse(data):
+            # Note in sparse case we don't subtract mean since data would become dense
+            scaled_data = data.multiply(self.scaler.scale_)
+            # Multiplying with csr matrix can return a coo sparse matrix
+            if not sp.sparse.isspmatrix_csr(data):
+                scaled_data = scaled_data.tocsr()
+        else:
+            scaled_data = (data - self.scaler.mean_) / self.scaler.scale_
+        return scaled_data
 
     def explain_instance(
         self,
@@ -397,52 +455,93 @@ class LimeTabularExplainer(object):
         if sp.sparse.issparse(data_row) and not sp.sparse.isspmatrix_csr(data_row):
             # Preventative code: if sparse, convert to csr format if not in csr format already
             data_row = data_row.tocsr()
-        data, inverse = self.__data_inverse(data_row, num_samples, sampling_method)
-        if sp.sparse.issparse(data):
-            # Note in sparse case we don't subtract mean since data would become dense
-            scaled_data = data.multiply(self.scaler.scale_)
-            # Multiplying with csr matrix can return a coo sparse matrix
-            if not sp.sparse.isspmatrix_csr(scaled_data):
-                scaled_data = scaled_data.tocsr()
-        else:
-            scaled_data = (data - self.scaler.mean_) / self.scaler.scale_
-        distances = sklearn.metrics.pairwise_distances(
-            scaled_data, scaled_data[0].reshape(1, -1), metric=distance_metric
-        ).ravel()
+        if self.modelless_method != "training_knn":
+            data, inverse = self.__data_inverse(data_row, num_samples, sampling_method)
+            scaled_data = self.scale_data(data)
+            distances = sklearn.metrics.pairwise_distances(
+                scaled_data, scaled_data[0].reshape(1, -1), metric=distance_metric
+            ).ravel()  # These are the distances used for scaling
+        # TODO, is this a bug in the LIME code since the scaling values for categorical variables are compute before they are encoded as 0 the same and 1 different
+        # TODO why is scale for all categorical features set to 1? - manually set, how to do in our other distance calculation
         if not self.modelless_method:
             yss = predict_fn(
                 inverse
             )  # TODO pass in predictions instead of using predict function
         else:
+            # TODO Transform Categorical Features in Training Data for distance calculations: - do this once in init method
             if self.modelless_method == "training_knn":
-                # TODO smarter way to choose number of KNN samples 
-                n_neighbors = min(len(self.training_data), len(inverse))
-                nearest_neighbors = NearestNeighbors(n_neighbors=n_neighbors)
-                nearest_neighbors.fit(self.training_data)
-                _, neighbors = nearest_neighbors.kneighbors(
-                    data_row.reshape(1, -1)
-                )  # Sample k nearest neighbors to hour point of interest
-                real_points = self.training_data[neighbors[0]]
+                # TODO smarter way to choose number of KNN samples
+                scaled_training_data = self.set_categorical_distances(
+                    self.scale_data(
+                        np.concatenate(
+                            (data_row.reshape(1, -1), self.training_data), axis=0
+                        )
+                    )  # sent distances from explanation point
+                )
+                scaled_data = scaled_training_data[1:]
+                if num_samples > len(self.training_data):
+                    #  TODO is there a distance based sampling method we can use.
+                    real_points = (
+                        self.training_data
+                    )  # use every training data point - every instance will have the exact same explanation
+                    distances = sklearn.metrics.pairwise_distances(
+                        scaled_training_data[1:],
+                        scaled_training_data[0].reshape(1, -1),
+                        metric=distance_metric,
+                    ).ravel()
+                else:
+                    n_neighbors = min(len(self.training_data), num_samples)
+                    nearest_neighbors = NearestNeighbors(n_neighbors=n_neighbors)
+                    nearest_neighbors.fit(
+                        scaled_training_data[1:]
+                    )  # omit point of interest
+                    distances, neighbors = nearest_neighbors.kneighbors(
+                        scaled_training_data[0].reshape(1, -1)
+                    )  # Sample k nearest neighbors to our point of interest
+                    distances = distances.squeeze(0)
+                    real_points = self.training_data[neighbors[0]]
+                    scaled_data = scaled_data[neighbors[0]]
             else:
-                distances, real_points = self.perturbation_training_neighbors(inverse)
-                real_points = real_points.squeeze(axis=1)
+                # One hot encode categorical variables for distance computation
+                self.one_hot_encoded_training_data = self.one_hot_encode(
+                    self.scale_data(self.training_data)
+                )
+                (
+                    point_distances,
+                    real_points,
+                    scaled_real_points,
+                ) = self.perturbation_training_neighbors(
+                    self.one_hot_encode(
+                        self.scale_data(inverse)
+                    )  # One hot encode perturbations
+                )
+                real_points = real_points.squeeze(
+                    axis=1
+                )  # real points in unscaled space to evaluate model on
                 if self.modelless_method == "training_data":
-                    inverse = real_points  # use real points to fit local model
+                    inverse = real_points
+                    scaled_real_points = scaled_real_points.squeeze(axis=1)
+                    scaled_real_points = self.set_categorical_distances(
+                        scaled_real_points
+                    )
+                    distances = sklearn.metrics.pairwise_distances(
+                        scaled_real_points,
+                        scaled_real_points[0].reshape(1, -1),
+                        metric=distance_metric,
+                    ).ravel()
+                    scaled_data = scaled_real_points  # use real points for linear model
                 elif self.modelless_method == "perturbation_data":
-                    # Use perturbed points to fit local model
+                    # y will be real point labels, X will be perturbed data (inverse)
                     pass
             real_points[0] = data_row
             # LIME expects data point of interest to be first entry in data
-            yss = predict_fn(
+            yss = predict_fn(  #
                 real_points
             )  # assume access to probabilistic outputs on real data points for now
+        self.distances = distances
         ### Things to calculate
-        # 1. average L2 distance between perturbation and real data point 
+        # 1. average L2 distance between perturbation and real data point
         # pairwise L2 distance averages between methods 4 methods -> 6 pairwise comparisons
-
-
-
-
         # for classification, the model needs to provide a list of tuples - classes
         # along with prediction probabilities
         if self.mode == "classification":
@@ -636,7 +735,8 @@ class LimeTabularExplainer(object):
                     num_samples, num_cols
                 )
                 data = np.array(data)
-
+            instance_sample = np.array(instance_sample)
+            data = np.array(data)
             if self.sample_around_instance:
                 data = data * scale + instance_sample
             else:
@@ -682,6 +782,14 @@ class LimeTabularExplainer(object):
             inverse[1:] = self.discretizer.undiscretize(inverse[1:])
         inverse[0] = data_row
         return data, inverse
+
+    def set_categorical_distances(self, data):
+        first_row = data[0]
+        for column in self.categorical_features:
+            binary_column = (data[:, column] == first_row[column]).astype(int)
+            binary_column[0] = 1
+            data[:, column] = binary_column
+        return data
 
 
 class RecurrentTabularExplainer(LimeTabularExplainer):

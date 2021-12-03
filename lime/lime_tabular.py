@@ -420,19 +420,7 @@ class LimeTabularExplainer(object):
     ):
         """Generates explanations for a prediction.
 
-        First, we generate neighborhood data by randomly perturbing features
-        from the instance (see __data_inverse). We then learn locally weighted
-        linear models on this neighborhood data to explain each of the classes
-        in an interpretable way (see lime_base.py).
-
-        Args:
-            data_row: 1d numpy array or scipy.sparse matrix, corresponding to a row
-            predict_fn: prediction function. For classifiers, this should be a
-                function that takes a numpy array and outputs prediction
-                probabilities. For regressors, this takes a numpy array and
-                returns the predictions. For ScikitClassifiers, this is
-                `classifier.predict_proba()`. For ScikitRegressors, this
-                is `regressor.predict()`. The prediction function needs to work
+        First, we generate neighborhood data by randomly perturbing features from the instance (see __data_inverse). We then learn locally weighted linear models on this neighborhood data to explain each of the classes in an interpretable way (see lime_base.py). Args: data_row: 1d numpy array or scipy.sparse matrix, corresponding to a row predict_fn: prediction function. For classifiers, this should be a function that takes a numpy array and outputs prediction probabilities. For regressors, this takes a numpy array and returns the predictions. For ScikitClassifiers, this is `classifier.predict_proba()`. For ScikitRegressors, this is `regressor.predict()`. The prediction function needs to work
                 on multiple feature vectors (the vectors randomly perturbed
                 from the data_row).
             labels: iterable with labels to be explained.
@@ -463,6 +451,7 @@ class LimeTabularExplainer(object):
             ).ravel()  # These are the distances used for scaling
         # TODO, is this a bug in the LIME code since the scaling values for categorical variables are compute before they are encoded as 0 the same and 1 different
         # TODO why is scale for all categorical features set to 1? - manually set, how to do in our other distance calculation
+        real_points = None
         if not self.modelless_method:
             yss = predict_fn(
                 inverse
@@ -539,6 +528,8 @@ class LimeTabularExplainer(object):
                 real_points
             )  # assume access to probabilistic outputs on real data points for now
         self.distances = distances
+        self.perturbation_points = inverse
+        self.real_points = real_points
         ### Things to calculate
         # 1. average L2 distance between perturbation and real data point
         # pairwise L2 distance averages between methods 4 methods -> 6 pairwise comparisons

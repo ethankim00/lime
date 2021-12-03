@@ -528,7 +528,7 @@ class LimeTabularExplainer(object):
                 real_points
             )  # assume access to probabilistic outputs on real data points for now
         self.distances = distances
-        self.perturbation_points = inverse
+        self.perturbation_points = inverse if self.modelless_method != "training_knn" else None
         self.real_points = real_points
         ### Things to calculate
         # 1. average L2 distance between perturbation and real data point
